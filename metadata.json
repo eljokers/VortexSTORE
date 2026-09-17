@@ -1,0 +1,8 @@
+{
+  "name": "Remix Remix VORTEX MC",
+  "description": "VORTEX MC Network — The Ultimate Lifesteal \u0026 Survival Experience.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
