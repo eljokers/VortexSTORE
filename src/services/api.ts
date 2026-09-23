@@ -1,4 +1,19 @@
+import { 
+  collection, 
+  doc, 
+  setDoc, 
+  updateDoc, 
+  deleteDoc, 
+  onSnapshot, 
+  query, 
+  orderBy, 
+  getDocs 
+} from 'firebase/firestore';
+import { db } from '../lib/firebase';
 import { StoreOrder, OrderStatus, StaffApplication, ApplicationStatus } from '../types';
+
+const ORDERS_COLLECTION = 'orders';
+const APPLICATIONS_COLLECTION = 'staff_applications';
 
 const MOCK_ORDER_IDS = new Set([
   'VTX-VC-89K2-1049',
@@ -13,7 +28,7 @@ const MOCK_PLAYERS = new Set([
 ]);
 
 /**
- * Filter out any mock orders from client cache
+ * فلترة الطلبات الوهمية
  */
 export function sanitizeOrders(orders: StoreOrder[]): StoreOrder[] {
   if (!Array.isArray(orders)) return [];
@@ -27,45 +42,44 @@ export function sanitizeOrders(orders: StoreOrder[]): StoreOrder[] {
 }
 
 /**
- * Fetch real orders from the backend with localStorage cache fallback
+ * جلب جميع الطلبات من Firestore
  */
 export async function fetchOrders(): Promise<StoreOrder[]> {
   try {
-    const res = await fetch('/api/orders', {
-      headers: { Accept: 'application/json' },
-    });
-    if (res.ok) {
-      const data = await res.json();
-      if (Array.isArray(data)) {
-        const cleaned = sanitizeOrders(data);
-        localStorage.setItem('vortex_orders', JSON.stringify(cleaned));
-        return cleaned;
-      }
-    }
+    const q = query(collection(db, ORDERS_COLLECTION), orderBy('timestamp', 'desc'));
+    const querySnapshot = await getDocs(q);
+    const orders = querySnapshot.docs.map(doc => doc.data() as StoreOrder);
+    return sanitizeOrders(orders);
   } catch (err) {
-    console.warn('Network error fetching orders from server, using local cache', err);
+    console.warn('Error fetching orders from Firestore:', err);
+    return [];
   }
-
-  // Fallback to local storage
-  try {
-    const saved = localStorage.getItem('vortex_orders');
-    if (saved) {
-      const parsed = JSON.parse(saved);
-      return sanitizeOrders(parsed);
-    }
-  } catch {
-    // ignore
-  }
-
-  return [];
 }
 
 /**
- * Detect client IP from server or fallback
+ * الاستماع الفوري للطلبات (Realtime) لـ Staff Dashboard
+ */
+export function subscribeToOrders(callback: (orders: StoreOrder[]) => void): () => void {
+  try {
+    const q = query(collection(db, ORDERS_COLLECTION), orderBy('timestamp', 'desc'));
+    return onSnapshot(q, (snapshot) => {
+      const orders: StoreOrder[] = snapshot.docs.map(doc => doc.data() as StoreOrder);
+      callback(sanitizeOrders(orders));
+    }, (error) => {
+      console.error('Error listening to orders:', error);
+    });
+  } catch (e) {
+    console.error('Firestore listener failed:', e);
+    return () => {};
+  }
+}
+
+/**
+ * جلب IP العميل
  */
 export async function fetchClientIp(): Promise<string> {
   try {
-    const res = await fetch('/api/my-ip');
+    const res = await fetch('https://api.ipify.org?format=json');
     if (res.ok) {
       const data = await res.json();
       if (data.ip) return data.ip;
@@ -77,47 +91,38 @@ export async function fetchClientIp(): Promise<string> {
 }
 
 /**
- * Submit a real order to backend and cache locally
+ * تقديم طلب جديد وحفظه في Firestore وإرسال إشعار للديسكورد
  */
 export async function submitOrder(order: StoreOrder): Promise<StoreOrder> {
-  // 1. Immediately save to local storage for instant responsiveness
   try {
-    const existing = sanitizeOrders(JSON.parse(localStorage.getItem('vortex_orders') || '[]'));
-    const filtered = existing.filter((o) => o.orderId !== order.orderId);
-    const updated = [order, ...filtered];
-    localStorage.setItem('vortex_orders', JSON.stringify(updated.slice(0, 100)));
+    const orderRef = doc(db, ORDERS_COLLECTION, order.orderId);
+    const cleanData = {
+      ...order,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
 
-    // Also store user's own orders for order tracking
-    const myOrders = JSON.parse(localStorage.getItem('vortex_my_orders') || '[]');
-    const myFiltered = myOrders.filter((o: StoreOrder) => o.orderId !== order.orderId);
-    localStorage.setItem('vortex_my_orders', JSON.stringify([order, ...myFiltered]));
+    // 1. حفظ في Firestore
+    await setDoc(orderRef, cleanData);
+
+    // 2. إرسال إشعار آمن للديسكورد عبر Vercel API
+    fetch('/api/discord-notify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(order)
+    }).catch(err => console.error('Discord notification error:', err));
 
     window.dispatchEvent(new CustomEvent('vortex_order_created', { detail: order }));
     window.dispatchEvent(new Event('vortex_orders_updated'));
   } catch (e) {
-    console.error('Failed to cache order locally', e);
-  }
-
-  // 2. Persist to server backend
-  try {
-    const res = await fetch('/api/orders', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(order),
-    });
-    if (res.ok) {
-      const result = await res.json();
-      return result.order || order;
-    }
-  } catch (err) {
-    console.warn('Server error saving order, order saved locally', err);
+    console.error('Failed to submit order to Firestore:', e);
   }
 
   return order;
 }
 
 /**
- * Update order status on backend and locally
+ * تحديث حالة الطلب في Firestore
  */
 export async function updateOrderStatusApi(
   orderId: string,
@@ -126,150 +131,75 @@ export async function updateOrderStatusApi(
   staffNotes?: string,
   reviewedBy?: string
 ): Promise<StoreOrder | null> {
-  let updatedOrder: StoreOrder | null = null;
   const now = Date.now();
   const nowStr = new Date().toLocaleString('ar-EG', { dateStyle: 'short', timeStyle: 'short' });
-  // Update local storage
-  try {
-    const existing = sanitizeOrders(JSON.parse(localStorage.getItem('vortex_orders') || '[]'));
-    const updated = existing.map((o) => {
-      if (o.orderId === orderId) {
-        updatedOrder = {
-          ...o,
-          status: newStatus,
-          ...(reason ? { cancellationReason: reason } : {}),
-          ...(staffNotes !== undefined ? { staffNotes } : {}),
-          ...(reviewedBy ? { reviewedBy } : {}),
-          reviewedAt: nowStr,
-          reviewedTimestamp: now,
-          archived: false,
-        };
-        return updatedOrder;
-      }
-      return o;
-    });
-    localStorage.setItem('vortex_orders', JSON.stringify(updated));
-    window.dispatchEvent(new Event('vortex_orders_updated'));
-  } catch {
-    // ignore
-  }
 
-  // Update server
   try {
-    const res = await fetch(`/api/orders/${encodeURIComponent(orderId)}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        status: newStatus,
-        cancellationReason: reason,
-        staffNotes,
-        reviewedBy,
-        archived: false,
-      }),
+    const orderRef = doc(db, ORDERS_COLLECTION, orderId);
+    await updateDoc(orderRef, {
+      status: newStatus,
+      ...(reason ? { cancellationReason: reason } : {}),
+      ...(staffNotes !== undefined ? { staffNotes } : {}),
+      ...(reviewedBy ? { reviewedBy } : {}),
+      reviewedAt: nowStr,
+      reviewedTimestamp: now,
+      archived: false,
     });
-    if (res.ok) {
-      const data = await res.json();
-      if (data && data.order) {
-        return data.order as StoreOrder;
-      }
-    }
+    window.dispatchEvent(new Event('vortex_orders_updated'));
   } catch (err) {
-    console.warn('Failed to update order status on server', err);
+    console.warn('Failed to update order status on Firestore:', err);
   }
-  return updatedOrder;
+  return null;
 }
 
 /**
- * Archive or unarchive order
+ * أرشفة / إلغاء أرشفة طلب
  */
 export async function archiveOrderApi(orderId: string, archived: boolean = true): Promise<void> {
   try {
-    const existing = sanitizeOrders(JSON.parse(localStorage.getItem('vortex_orders') || '[]'));
-    const updated = existing.map((o) => (o.orderId === orderId ? { ...o, archived } : o));
-    localStorage.setItem('vortex_orders', JSON.stringify(updated));
+    const orderRef = doc(db, ORDERS_COLLECTION, orderId);
+    await updateDoc(orderRef, { archived });
     window.dispatchEvent(new Event('vortex_orders_updated'));
-  } catch {
-    // ignore
-  }
-
-  try {
-    await fetch(`/api/orders/${encodeURIComponent(orderId)}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ archived }),
-    });
   } catch (err) {
-    console.warn('Failed to archive order on server', err);
+    console.warn('Failed to archive order on Firestore:', err);
   }
 }
 
 /**
- * Update order notes
+ * تحديث ملاحظات الطلب
  */
 export async function updateOrderNotesApi(orderId: string, notes: string): Promise<void> {
   try {
-    const existing = sanitizeOrders(JSON.parse(localStorage.getItem('vortex_orders') || '[]'));
-    const updated = existing.map((o) => (o.orderId === orderId ? { ...o, staffNotes: notes } : o));
-    localStorage.setItem('vortex_orders', JSON.stringify(updated));
+    const orderRef = doc(db, ORDERS_COLLECTION, orderId);
+    await updateDoc(orderRef, { staffNotes: notes });
     window.dispatchEvent(new Event('vortex_orders_updated'));
-  } catch {
-    // ignore
-  }
-
-  try {
-    await fetch(`/api/orders/${encodeURIComponent(orderId)}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ staffNotes: notes }),
-    });
   } catch (err) {
-    console.warn('Failed to update order notes on server', err);
+    console.warn('Failed to update order notes on Firestore:', err);
   }
 }
 
 /**
- * Delete order from backend and cache
+ * حذف طلب من Firestore
  */
 export async function deleteOrderApi(orderId: string): Promise<void> {
   try {
-    const existing = sanitizeOrders(JSON.parse(localStorage.getItem('vortex_orders') || '[]'));
-    const updated = existing.filter((o) => o.orderId !== orderId);
-    localStorage.setItem('vortex_orders', JSON.stringify(updated));
+    const orderRef = doc(db, ORDERS_COLLECTION, orderId);
+    await deleteDoc(orderRef);
     window.dispatchEvent(new Event('vortex_orders_updated'));
-  } catch {
-    // ignore
-  }
-
-  try {
-    await fetch(`/api/orders/${encodeURIComponent(orderId)}`, {
-      method: 'DELETE',
-    });
   } catch (err) {
-    console.warn('Failed to delete order on server', err);
+    console.warn('Failed to delete order on Firestore:', err);
   }
 }
 
 /**
- * Clean all mock / dummy orders
+ * تنظيف الطلبات الوهمية
  */
 export async function cleanMockOrdersApi(): Promise<void> {
-  try {
-    const existing = sanitizeOrders(JSON.parse(localStorage.getItem('vortex_orders') || '[]'));
-    localStorage.setItem('vortex_orders', JSON.stringify(existing));
-    window.dispatchEvent(new Event('vortex_orders_updated'));
-  } catch {
-    // ignore
-  }
-
-  try {
-    await fetch('/api/orders/clean-mock', { method: 'POST' });
-  } catch {
-    // ignore
-  }
+  window.dispatchEvent(new Event('vortex_orders_updated'));
 }
 
 /**
- * Sanitize staff applications list to remove any mock/fake entries
+ * تنظيف تقديمات الإدارة الوهمية
  */
 export function sanitizeApplications(apps: any[]): StaffApplication[] {
   if (!Array.isArray(apps)) return [];
@@ -287,7 +217,7 @@ export function sanitizeApplications(apps: any[]): StaffApplication[] {
 }
 
 /**
- * Generate in-game Minecraft console commands for rank or package delivery
+ * إنشاء أوامر ماينكرافت التلقائية للرتب والباقات
  */
 export function getMinecraftCommandForPackage(pkg: string, player: string): {
   primaryCommand: string;
@@ -345,68 +275,37 @@ export function getMinecraftCommandForPackage(pkg: string, player: string): {
 }
 
 /**
- * Fetch staff applications
+ * جلب تقديمات الإدارة من Firestore
  */
 export async function fetchApplications(): Promise<StaffApplication[]> {
   try {
-    const res = await fetch('/api/applications', {
-      headers: { Accept: 'application/json' },
-    });
-    if (res.ok) {
-      const data = await res.json();
-      if (Array.isArray(data)) {
-        const cleaned = sanitizeApplications(data);
-        localStorage.setItem('vortex_staff_applications_ar_v1', JSON.stringify(cleaned));
-        return cleaned;
-      }
-    }
+    const q = query(collection(db, APPLICATIONS_COLLECTION));
+    const querySnapshot = await getDocs(q);
+    const apps = querySnapshot.docs.map(doc => doc.data() as StaffApplication);
+    return sanitizeApplications(apps);
   } catch {
-    // ignore
+    return [];
   }
-
-  try {
-    const saved = localStorage.getItem('vortex_staff_applications_ar_v1');
-    if (saved) {
-      return sanitizeApplications(JSON.parse(saved));
-    }
-  } catch {
-    // ignore
-  }
-
-  return [];
 }
 
 /**
- * Submit staff application
+ * إرسال تقديم جديد للإدارة في Firestore
  */
 export async function submitApplication(app: StaffApplication): Promise<StaffApplication> {
   try {
-    const existing = sanitizeApplications(
-      JSON.parse(localStorage.getItem('vortex_staff_applications_ar_v1') || '[]')
-    );
-    const updated = [app, ...existing.filter((a: StaffApplication) => a.id !== app.id)];
-    localStorage.setItem('vortex_staff_applications_ar_v1', JSON.stringify(updated));
+    const appRef = doc(db, APPLICATIONS_COLLECTION, app.id);
+    await setDoc(appRef, app);
     window.dispatchEvent(new CustomEvent('vortex_application_submitted', { detail: app }));
     window.dispatchEvent(new Event('vortex_applications_updated'));
-  } catch {
-    // ignore
-  }
-
-  try {
-    await fetch('/api/applications', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(app),
-    });
   } catch (err) {
-    console.warn('Failed to submit application to server', err);
+    console.warn('Failed to submit application to Firestore', err);
   }
 
   return app;
 }
 
 /**
- * Update staff application status
+ * تحديث حالة التقديم
  */
 export async function updateApplicationStatusApi(
   id: string,
@@ -418,134 +317,63 @@ export async function updateApplicationStatusApi(
   const reviewedAt = new Date().toLocaleString('ar-EG', { dateStyle: 'short', timeStyle: 'short' });
 
   try {
-    const existing = sanitizeApplications(
-      JSON.parse(localStorage.getItem('vortex_staff_applications_ar_v1') || '[]')
-    );
-    const updated = existing.map((app) => {
-      if (app.id === id) {
-        return {
-          ...app,
-          status,
-          ...(notes !== undefined ? { notes } : {}),
-          ...(reviewedBy ? { reviewedBy } : {}),
-          reviewedAt,
-          reviewedTimestamp: now,
-          archived: false,
-        };
-      }
-      return app;
+    const appRef = doc(db, APPLICATIONS_COLLECTION, id);
+    await updateDoc(appRef, {
+      status,
+      ...(notes !== undefined ? { notes } : {}),
+      ...(reviewedBy ? { reviewedBy } : {}),
+      reviewedAt,
+      reviewedTimestamp: now,
+      archived: false,
     });
-    localStorage.setItem('vortex_staff_applications_ar_v1', JSON.stringify(updated));
     window.dispatchEvent(new Event('vortex_applications_updated'));
-  } catch {
-    // ignore
-  }
-
-  try {
-    await fetch(`/api/applications/${encodeURIComponent(id)}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status, notes, reviewedBy, archived: false }),
-    });
   } catch (err) {
-    console.warn('Failed to update application status on server', err);
+    console.warn('Failed to update application status on Firestore', err);
   }
 }
 
 /**
- * Archive or unarchive staff application
+ * أرشفة التقديم
  */
 export async function archiveApplicationApi(id: string, archived: boolean = true): Promise<void> {
   try {
-    const existing = sanitizeApplications(
-      JSON.parse(localStorage.getItem('vortex_staff_applications_ar_v1') || '[]')
-    );
-    const updated = existing.map((app) => (app.id === id ? { ...app, archived } : app));
-    localStorage.setItem('vortex_staff_applications_ar_v1', JSON.stringify(updated));
+    const appRef = doc(db, APPLICATIONS_COLLECTION, id);
+    await updateDoc(appRef, { archived });
     window.dispatchEvent(new Event('vortex_applications_updated'));
-  } catch {
-    // ignore
-  }
-
-  try {
-    await fetch(`/api/applications/${encodeURIComponent(id)}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ archived }),
-    });
   } catch (err) {
-    console.warn('Failed to archive application on server', err);
+    console.warn('Failed to archive application on Firestore', err);
   }
 }
 
 /**
- * Update staff application notes
+ * تحديث ملاحظات التقديم
  */
 export async function updateApplicationNotesApi(id: string, notes: string): Promise<void> {
   try {
-    const existing = sanitizeApplications(
-      JSON.parse(localStorage.getItem('vortex_staff_applications_ar_v1') || '[]')
-    );
-    const updated = existing.map((app) => (app.id === id ? { ...app, notes } : app));
-    localStorage.setItem('vortex_staff_applications_ar_v1', JSON.stringify(updated));
+    const appRef = doc(db, APPLICATIONS_COLLECTION, id);
+    await updateDoc(appRef, { notes });
     window.dispatchEvent(new Event('vortex_applications_updated'));
-  } catch {
-    // ignore
-  }
-
-  try {
-    await fetch(`/api/applications/${encodeURIComponent(id)}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ notes }),
-    });
   } catch (err) {
-    console.warn('Failed to update application notes on server', err);
+    console.warn('Failed to update application notes on Firestore', err);
   }
 }
 
 /**
- * Delete application
+ * حذف تقديم من Firestore
  */
 export async function deleteApplicationApi(id: string): Promise<void> {
   try {
-    const existing = sanitizeApplications(
-      JSON.parse(localStorage.getItem('vortex_staff_applications_ar_v1') || '[]')
-    );
-    const updated = existing.filter((a) => a.id !== id);
-    localStorage.setItem('vortex_staff_applications_ar_v1', JSON.stringify(updated));
+    const appRef = doc(db, APPLICATIONS_COLLECTION, id);
+    await deleteDoc(appRef);
     window.dispatchEvent(new Event('vortex_applications_updated'));
-  } catch {
-    // ignore
-  }
-
-  try {
-    await fetch(`/api/applications/${encodeURIComponent(id)}`, {
-      method: 'DELETE',
-    });
   } catch (err) {
-    console.warn('Failed to delete application on server', err);
+    console.warn('Failed to delete application on Firestore', err);
   }
 }
 
 /**
- * Clean all mock / dummy staff applications
+ * تنظيف التقديمات الوهمية
  */
 export async function cleanMockApplicationsApi(): Promise<void> {
-  try {
-    const existing = sanitizeApplications(
-      JSON.parse(localStorage.getItem('vortex_staff_applications_ar_v1') || '[]')
-    );
-    localStorage.setItem('vortex_staff_applications_ar_v1', JSON.stringify(existing));
-    window.dispatchEvent(new Event('vortex_applications_updated'));
-  } catch {
-    // ignore
-  }
-
-  try {
-    await fetch('/api/applications/clean-mock', { method: 'POST' });
-  } catch {
-    // ignore
-  }
+  window.dispatchEvent(new Event('vortex_applications_updated'));
 }
-
